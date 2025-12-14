@@ -1,0 +1,10 @@
+streamlit
+ccxt
+scikit-learn
+pandas
+numpy
+plotly
+python-telegram-bot
+twilio
+requests
+python-dotenv
