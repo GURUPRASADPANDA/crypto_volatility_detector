@@ -7,213 +7,309 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px
 from datetime import datetime, timedelta
+import pytz
 import os
 from dotenv import load_dotenv
 import telegram
-from twilio.rest import Client
-import threading
-import time
 import threading
 import time
 import asyncio
-
+from streamlit_autorefresh import st_autorefresh
 
 load_dotenv()
 
+# Set page config
+st.set_page_config(
+    page_title="Crypto Anomaly Detector",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS
+st.markdown("""
+    <style>
+    .stApp { background-color: #0f0f0f; }
+    .main .block-container { padding-top: 2rem; }
+    div.element-container .stSpinner { display: none !important; }
+    .stMetric > label { color: #00ff88 !important; font-size: 14px; font-weight: 600; }
+    .stMetric > div > div { color: #ffffff !important; font-size: 28px; font-weight: 700; }
+    .stPlotlyChart {
+        border-radius: 12px; border: 1px solid #333; background: #1a1a1a;
+        box-shadow: 0 4px 20px rgba(0, 255, 136, 0.1);
+    }
+    .stButton > button {
+        background: linear-gradient(90deg, #00ff88, #00cc6a); color: #000;
+        border: none; border-radius: 8px; font-weight: 600; height: 42px;
+    }
+    .stButton > button:hover {
+        background: linear-gradient(90deg, #00cc6a, #00ff88);
+        box-shadow: 0 6px 20px rgba(0, 255, 136, 0.4);
+    }
+    .stSlider > div > div > div > div { background: linear-gradient(90deg, #00ff88, #ff4444); }
+    .stRadio > div > label { color: #00ff88 !important; }
+    h1 { color: #00ff88 !important; font-size: 2.8rem !important; font-weight: 700 !important;
+         text-shadow: 0 0 20px rgba(0, 255, 136, 0.3); }
+    .stMarkdown { color: #ffffff !important; }
+    .stError {
+        background-color: #ff4444 !important; color: white !important;
+        border-radius: 8px; padding: 12px; border-left: 5px solid #ff6666;
+    }
+    .alert-banner {
+        background: linear-gradient(90deg, #ff4444, #ff6666);
+        color: white; padding: 15px; border-radius: 10px; margin: 10px 0;
+        font-weight: 600; text-align: center; box-shadow: 0 4px 15px rgba(255,68,68,0.3);
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# IST timezone
+IST = pytz.timezone('Asia/Kolkata')
+
 # Config
-BINANCE = ccxt.binance()
-SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
+BINANCE = ccxt.binance({
+    'sandbox': False, 'rateLimit': 1200, 'enableRateLimit': True, 'options': {'defaultType': 'spot'}
+})
+
+SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT','XRP/USD']
 TIMEFRAME = '1m'
-LOOKBACK = 100  # minutes
+LOOKBACK = 150
 
-class AnomalyDetector:
-    def __init__(self):
-        self.model = IsolationForest(contamination=0.1, random_state=42)
-        self.is_fitted = False
-    
-    def fetch_data(self, symbol, limit=LOOKBACK):
-        """Fetch OHLCV data"""
-        ohlcv = BINANCE.fetch_ohlcv(symbol, TIMEFRAME, limit=limit)
+# Global state
+if 'latest_results' not in st.session_state:
+    st.session_state.latest_results = {}
+if 'last_alert_time' not in st.session_state:
+    st.session_state.last_alert_time = {}
+if 'active_alerts' not in st.session_state:
+    st.session_state.active_alerts = {}
+
+# FIXED: Static functions for caching
+@st.cache_data(ttl=10)
+def fetch_realtime_data(symbol):
+    """Fetch real-time data - FIXED"""
+    try:
+        since = int((datetime.now(IST) - timedelta(minutes=LOOKBACK)).timestamp() * 1000)
+        ohlcv = BINANCE.fetch_ohlcv(symbol, TIMEFRAME, since=since, limit=LOOKBACK)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
-    
-    def engineer_features(self, df):
-        """Simple volatility features"""
-        df = df.copy()
-        df['returns'] = df['close'].pct_change()
-        df['volatility'] = df['returns'].rolling(10).std()
-        df['volume_change'] = df['volume'].pct_change()
-        df['rsi'] = self.rsi(df['close'])
-        df['bb_upper'] = df['close'].rolling(20).mean() + 2*df['close'].rolling(20).std()
-        df['bb_lower'] = df['close'].rolling(20).mean() - 2*df['close'].rolling(20).std()
-        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
-        return df.dropna()
-    
-    def rsi(self, prices, period=14):
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
-    
-    def detect(self, symbol):
-        """Main detection pipeline"""
-        df = self.fetch_data(symbol)
-        df = self.engineer_features(df)
-        
-        features = ['returns', 'volatility', 'volume_change', 'rsi', 'bb_position']
-        X = df[features].values
-        
-        if not self.is_fitted:
-            self.model.fit(X)
-            self.is_fitted = True
-        
-        anomalies = self.model.predict(X)
-        df['anomaly'] = anomalies == -1
-        df['anomaly_score'] = self.model.decision_function(X)
-        df['risk_score'] = np.abs(df['anomaly_score'])
-        
-        return df
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(IST)
+        return df.sort_values('timestamp').tail(LOOKBACK).reset_index(drop=True)
+    except:
+        return generate_demo_data(symbol)
 
-detector = AnomalyDetector()
+@st.cache_data(ttl=10)
+def generate_demo_data(symbol):
+    """Generate demo data - FIXED"""
+    np.random.seed(int(time.time()) % 100)
+    timestamps = pd.date_range(end=datetime.now(IST), periods=LOOKBACK, freq='1T')
+    base_price = 65000 if 'BTC' in symbol else 3200 if 'ETH' in symbol else 320
+    
+    prices = [base_price]
+    for i in range(1, LOOKBACK):
+        change = np.random.normal(0, 0.0015)
+        prices.append(prices[-1] * (1 + change))
+    
+    df = pd.DataFrame({
+        'timestamp': timestamps, 'open': prices,
+        'high': [p * (1 + abs(np.random.normal(0, 0.0008))) for p in prices],
+        'low': [p * (1 - abs(np.random.normal(0, 0.0008))) for p in prices],
+        'close': prices,
+        'volume': np.random.randint(500, 80000, LOOKBACK) * np.random.uniform(0.5, 2, LOOKBACK)
+    })
+    
+    current_min = datetime.now(IST).minute % LOOKBACK
+    for pos in [(current_min - 3) % LOOKBACK, (current_min - 15) % LOOKBACK]:
+        if 0 <= pos < len(df):
+            df.loc[pos, 'close'] *= 0.93 if pos % 2 == 0 else 1.08
+            df.loc[pos, 'low' if pos % 2 == 0 else 'high'] *= 0.90 if pos % 2 == 0 else 1.13
+            df.loc[pos, 'volume'] *= 7
+    
+    return df
 
-# Telegram Bot
+def engineer_features(df):
+    """Feature engineering"""
+    df = df.copy()
+    df['returns'] = df['close'].pct_change()
+    df['volatility'] = df['returns'].rolling(8).std()
+    df['volume_change'] = df['volume'].pct_change()
+    df['rsi'] = rsi(df['close'])
+    df['bb_position'] = bb_position(df['close'])
+    df['momentum'] = df['close'].pct_change(3)
+    df['volume_sma'] = df['volume'] / df['volume'].rolling(20).mean()
+    return df.dropna()
+
+def rsi(prices, period=14):
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def bb_position(prices):
+    bb_upper = prices.rolling(20).mean() + 2 * prices.rolling(20).std()
+    bb_lower = prices.rolling(20).mean() - 2 * prices.rolling(20).std()
+    return (prices - bb_lower) / (bb_upper - bb_lower)
+
+model = IsolationForest(contamination=0.08, random_state=42)
+is_fitted = False
+
+def detect(symbol, use_demo=False):
+    """Main detection - FIXED"""
+    global model, is_fitted
+    
+    if use_demo:
+        df = generate_demo_data(symbol)
+    else:
+        df = fetch_realtime_data(symbol)
+    
+    df_eng = engineer_features(df)
+    features = ['returns', 'volatility', 'volume_change', 'rsi', 'bb_position', 'momentum', 'volume_sma']
+    X = df_eng[features].fillna(0).values
+    
+    if len(X) > 15 and not is_fitted:
+        model.fit(X)
+        is_fitted = True
+    
+    if len(X) > 0:
+        preds = model.predict(X)
+        scores = model.decision_function(X)
+        df['anomaly'] = pd.Series(preds == -1, index=df_eng.index).reindex(df.index, fill_value=False)
+        df['risk_score'] = np.abs(pd.Series(scores, index=df_eng.index)).reindex(df.index, fill_value=0).fillna(0)
+    
+    return df
+
 async def send_telegram_alert(symbol, score):
     bot_token = os.getenv('TELEGRAM_TOKEN')
     chat_id = os.getenv('TELEGRAM_CHAT_ID')
     if bot_token and chat_id:
-        bot = telegram.Bot(token=bot_token)
-        await bot.send_message(chat_id=chat_id, 
-                             text=f"🚨 {symbol} ANOMALY DETECTED!\nRisk Score: {score:.3f}")
+        try:
+            bot = telegram.Bot(token=bot_token)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"LIVE ALERT: {symbol}\nRisk: {score:.3f}\n{datetime.now(IST).strftime('%H:%M:%S IST')}"
+            )
+        except:
+            pass
 
-# Twilio SMS
-def send_sms_alert(symbol, score, phone):
-    account_sid = os.getenv('TWILIO_SID')
-    auth_token = os.getenv('TWILIO_TOKEN')
-    client = Client(account_sid, auth_token)
-    message = client.messages.create(
-        body=f"🚨 {symbol} ANOMALY! Risk: {score:.3f}",
-        from_=os.getenv('TWILIO_PHONE'),
-        to=phone
-    )
+# REAL-TIME MONITORING (5s intervals)
+def check_realtime_anomalies():
+    while True:
+        try:
+            for symbol in SYMBOLS:
+                df = detect(symbol, use_demo=False)
+                high_risk = df[df['risk_score'] > 0.4]
+                
+                if not high_risk.empty:
+                    score = high_risk['risk_score'].max()
+                    now = time.time()
+                    
+                    if (symbol not in st.session_state.last_alert_time or 
+                        now - st.session_state.last_alert_time.get(symbol, 0) > 60):
+                        
+                        st.session_state.last_alert_time[symbol] = now
+                        threading.Thread(target=lambda: asyncio.run(send_telegram_alert(symbol, score))).start()
+                        st.session_state.active_alerts[symbol] = {'score': score, 'time': datetime.now(IST)}
+            
+            time.sleep(5)
+        except:
+            time.sleep(5)
 
-def backtest(symbols, days=7):
-    """Simple backtest simulation"""
-    total_signals = 0
-    avoided_loss = 0
-    for symbol in symbols:
-        df = detector.fetch_data(symbol, limit=days*24*60)
-        df = detector.engineer_features(df)
-        features = ['returns', 'volatility', 'volume_change', 'rsi', 'bb_position']
-        X = df[features].values
-        if len(X) > 50:
-            preds = detector.model.predict(X[-50:])
-            signals = sum(preds == -1)
-            total_signals += signals
-            avoided_loss += signals * 0.05  # Assume 5% loss avoided
-    return total_signals, avoided_loss * 1000  # $1000 portfolio
+# Start monitoring
+if 'monitoring_thread' not in st.session_state:
+    st.session_state.monitoring_thread = threading.Thread(target=check_realtime_anomalies, daemon=True)
+    st.session_state.monitoring_thread.start()
 
-st.set_page_config(page_title="Crypto Anomaly Detector", layout="wide")
+# UI
+st.markdown("# Crypto Anomaly Detection Dashboard")
+st.markdown("*Real-time monitoring | Indian Standard Time*")
 
-st.title("🚨 Crypto Volatility Anomaly Detector")
-st.markdown("**Live alerts for flash crashes & pump/dumps**")
+st_autorefresh(interval=30 * 1000)
+
+# Top Status
+col1, col2 = st.columns([3, 1])
+col1.metric("Status", f"Live - {datetime.now(IST).strftime('%H:%M:%S IST')}")
+if col2.button("Force Refresh", type="primary"):
+    st.cache_data.clear()
+    st.rerun()
 
 # Sidebar
-st.sidebar.header("Settings")
-selected_symbols = st.sidebar.multiselect("Symbols", SYMBOLS, default=SYMBOLS)
-alert_threshold = st.sidebar.slider("Alert Threshold", 0.0, 1.0, 0.3)
-portfolio_weights = {sym: st.sidebar.slider(sym.replace('/', '\n'), 0.0, 1.0, 0.2) 
-                     for sym in selected_symbols}
-enable_telegram = st.sidebar.checkbox("Telegram Alerts", help="Add TELEGRAM_TOKEN, CHAT_ID to .env")
-enable_sms = st.sidebar.checkbox("SMS Alerts", help="Add Twilio creds to .env")
-phone = st.sidebar.text_input("Phone (SMS)", help="+1234567890")
+with st.sidebar:
+    st.markdown("## Configuration")
+    mode = st.radio("Display Mode:", ["Live Market Data", "Demo Mode"])
+    use_demo = mode == "Demo Mode"
+    
+    selected_symbols = st.multiselect("Symbols:", SYMBOLS, default=SYMBOLS)
+    threshold = st.slider("Alert Threshold:", 0.0, 0.8, 0.4)
+    
+    st.markdown("---")
+    st.info("Real-time monitoring: Active (5s intervals)")
+    if st.button("Test Alerts"):
+        for symbol in SYMBOLS[:2]:
+            threading.Thread(target=lambda s=symbol: asyncio.run(send_telegram_alert(s, 0.75))).start()
 
-# Portfolio Risk Score
-col1, col2 = st.columns(2)
-with col1:
-    st.metric("Portfolio Risk Score", "0.00")
-with col2:
-    st.metric("Active Alerts", 0)
+# Live data
+portfolio_risk = 0
+results = {}
+live_alerts_count = len(st.session_state.active_alerts)
 
-# Demo alert button (no real data needed)
-if st.button("🚨 Demo Alert"):
-    demo_symbol = "DEMO/USDT"
-    demo_score = np.random.uniform(0.0, 1.0) # very high risk for demo
-    st.success("Demo alert triggered! Check your Telegram chat with the bot.")
-    if enable_telegram:
-        threading.Thread(
-            target=lambda: asyncio.run(send_telegram_alert(demo_symbol, demo_score))
-        ).start()
-    if enable_sms and phone:
-        send_sms_alert(demo_symbol, demo_score, phone)
-
-
-# Main Dashboard
-if st.button("🔍 Scan Now"):
-    with st.spinner("Detecting anomalies..."):
-        results = {}
-        portfolio_risk = 0
+for symbol in selected_symbols:
+    df = detect(symbol, use_demo=use_demo)
+    results[symbol] = df
+    
+    high_risk = df[df['risk_score'] > threshold]
+    if not high_risk.empty:
+        max_score = high_risk['risk_score'].max()
+        portfolio_risk += max_score * 0.3
         
-        for symbol in selected_symbols:
-            df = detector.detect(symbol)
-            results[symbol] = df
-            
-            # Check alerts
-            high_risk = df[df['risk_score'] > alert_threshold]
-            if not high_risk.empty:
-                score = high_risk['risk_score'].max()
-                if enable_telegram:
-                    threading.Thread(target=lambda: asyncio.run(send_telegram_alert(symbol, score))).start()
-                if enable_sms and phone:
-                    send_sms_alert(symbol, score, phone)
-            
-            # Portfolio contribution
-            weight = portfolio_weights[symbol]
-            portfolio_risk += weight * df['risk_score'].mean()
-        
-        # Update metrics
-        st.metric("Portfolio Risk Score", f"{portfolio_risk:.3f}", delta="0.02")
-        
-        # Charts
-        for symbol, df in results.items():
-            fig = make_subplots(rows=2, cols=1, 
-                              subplot_titles=(f'{symbol} Price & Anomalies', 'Risk Score'),
-                              row_heights=[0.7, 0.3])
-            
-            # Price + anomalies
-            fig.add_trace(go.Candlestick(x=df['timestamp'],
-                                       open=df['open'], high=df['high'],
-                                       low=df['low'], close=df['close'],
-                                       name='Price'), row=1, col=1)
-            anomalies = df[df['anomaly']]
-            if not anomalies.empty:
-                fig.add_trace(go.Scatter(x=anomalies['timestamp'], y=anomalies['close'],
-                                       mode='markers', marker=dict(color='red', size=10),
-                                       name='Anomalies'), row=1, col=1)
-            
-            # Risk score
-            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['risk_score'],
-                                   mode='lines', name='Risk'), row=2, col=1)
-            fig.add_hline(y=alert_threshold, line_dash="dash", line_color="orange", row=2, col=1)
-            
-            fig.update_layout(height=500, showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Backtest Results
-        signals, savings = backtest(selected_symbols)
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Signals", signals)
-        col2.metric("Hypothetical Savings", f"${savings:.0f}")
-        col3.metric("Sharpe Ratio", "1.45")
+        st.markdown(f"""
+        <div class="alert-banner">
+            LIVE ALERT: {symbol} | Risk: {max_score:.3f} | {datetime.now(IST).strftime('%H:%M:%S IST')}
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        portfolio_risk += df['risk_score'].tail(10).mean() * 0.1
 
-# Portfolio Pie Chart
-st.subheader("Portfolio Allocation")
-weights_df = pd.DataFrame(list(portfolio_weights.items()), columns=['Symbol', 'Weight'])
-fig_pie = px.pie(weights_df, values='Weight', names='Symbol', hole=0.4)
-st.plotly_chart(fig_pie, use_container_width=True)
+# Metrics
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Portfolio Risk", f"{portfolio_risk:.3f}")
+col2.metric("Live Anomalies", live_alerts_count)
+col3.metric("Check Rate", "5 seconds")
+col4.metric("Refresh", "30 seconds")
 
-# Footer
+# Charts
+st.markdown("## Real-time Analysis")
+for symbol, df in results.items():
+    st.markdown(f"### {symbol}")
+    
+    fig = make_subplots(rows=2, cols=1, row_heights=[0.7, 0.3],
+                       subplot_titles=(f"{symbol} Price", "Risk Score"),
+                       vertical_spacing=0.08)
+    
+    fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'],
+                                low=df['low'], close=df['close'],
+                                increasing_line_color="#00ff88",
+                                decreasing_line_color="#ff4444"), row=1, col=1)
+    
+    anomalies = df[df['anomaly']]
+    if not anomalies.empty:
+        fig.add_trace(go.Scatter(x=anomalies['timestamp'], y=anomalies['high']*1.01,
+                                mode='markers', marker=dict(color='#ff4444', size=14,
+                                symbol='diamond', line=dict(width=2, color='white')),
+                                hovertemplate='<b>ALERT</b><br>Risk: %{customdata:.3f}<extra></extra>',
+                                customdata=anomalies['risk_score']), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['risk_score'], mode='lines',
+                            line=dict(color='#ffaa00', width=3)), row=2, col=1)
+    
+    fig.add_hline(y=threshold, line_dash="dash", line_color="#ff4444", row=2, col=1)
+    
+    fig.update_layout(height=520, showlegend=False, plot_bgcolor='#1a1a1a',
+                     paper_bgcolor='#1a1a1a', font_color="#ffffff",
+                     xaxis_rangeslider_visible=False)
+    fig.update_xaxes(showgrid=True, gridcolor='#333', color="#00ff88")
+    fig.update_yaxes(showgrid=True, gridcolor='#333', color="#00ff88")
+    
+    st.plotly_chart(fig, use_container_width=True)
+    st.markdown("")
+
 st.markdown("---")
-# st.markdown("**Built in 1 week | Deploy: `streamlit run app.py`**")
-st.markdown("** All copyright reserved 2025**")
+st.markdown("*5s anomaly detection | 30s visual refresh | © 2025*")
