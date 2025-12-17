@@ -115,7 +115,7 @@ def backtest(symbols, days=7):
 
 st.set_page_config(page_title="Crypto Anomaly Detector", layout="wide")
 
-st.title("🚨 Crypto Volatility Anomaly Detector")
+st.title("FENOIX: Crypto Volatility Anomaly Detector")
 st.markdown("**Live alerts for flash crashes & pump/dumps**")
 
 # Sidebar
